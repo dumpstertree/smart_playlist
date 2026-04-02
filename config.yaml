@@ -29,7 +29,7 @@ interpolation_count: 5
 #   diverse  -- RECOMMENDED: curved traversal + artist penalty (see below)
 interpolation_mode: diverse
  
-allow_anchors_in_pool: false
+allow_anchors_in_pool: true
 fuzzy_match_threshold: 0.6
  
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ fuzzy_match_threshold: 0.6
 # bridge back toward the first anchor, so the playlist loops seamlessly.
 # The bridge uses the same interpolation_mode and interpolation_count as
 # all other segments.
-loop: false
+loop: true
  
 # ---------------------------------------------------------------------------
 # Diverse mode settings

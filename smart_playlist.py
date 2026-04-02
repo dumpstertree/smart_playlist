@@ -818,74 +818,118 @@ def _az_request(endpoint, api_key, method="GET", data=None, content_type=None):
         return e.code, e.read().decode("utf-8", errors="replace")
     except urllib.error.URLError as e:
         raise ConnectionError("AzuraCast connection error: {}".format(e.reason))
-
-
+ 
+ 
 def azuracast_clear_playlist(base_url, api_key, station_id, playlist_id):
     """
-    Empty a playlist by fetching all its song entries and deleting them in bulk.
-    AzuraCast does not have a single-call "clear" endpoint, so we:
-      1. GET all media items currently in the playlist
-      2. DELETE each one by its playlist-song relationship ID
+    Clear all tracks from a playlist using the AzuraCast batch files API.
+ 
+    Strategy:
+      1. Paginate through all station files that belong to this playlist.
+      2. Collect their internal file IDs.
+      3. POST a single batch request that sets their playlists to empty,
+         removing them from this playlist in one call.
+ 
+    This is how the AzuraCast web UI clears a playlist internally.
     """
-    endpoint = "{}/api/station/{}/playlist/{}/songs".format(
-        base_url, station_id, playlist_id
-    )
-    status, body = _az_request(endpoint, api_key)
-    if status != 200:
-        log.warning("Could not fetch playlist songs (HTTP {}). Skipping clear.".format(status))
-        return
-
-    try:
-        songs = json.loads(body)
-    except json.JSONDecodeError:
-        log.warning("Could not parse playlist songs response. Skipping clear.")
-        return
-
-    if not songs:
-        log.info("Playlist already empty.")
-        return
-
-    log.info("Clearing {} existing track(s) from playlist...".format(len(songs)))
-    for song in songs:
-        song_id = song.get("id")
-        if not song_id:
-            continue
-        del_endpoint = "{}/api/station/{}/playlist/{}/song/{}".format(
-            base_url, station_id, playlist_id, song_id
+    log.info("Fetching current playlist contents...")
+ 
+    file_ids = []
+    page = 1
+    per_page = 100
+ 
+    while True:
+        endpoint = "{}/api/station/{}/files?playlist[]={}&per_page={}&page={}".format(
+            base_url, station_id, playlist_id, per_page, page
         )
-        s, _ = _az_request(del_endpoint, api_key, method="DELETE")
-        if s not in (200, 204):
-            log.warning("  Failed to delete song id {} (HTTP {})".format(song_id, s))
-
-    log.info("Playlist cleared.")
-
-
+        status, body = _az_request(endpoint, api_key)
+ 
+        if status != 200:
+            log.warning(
+                "Could not fetch playlist files (HTTP {}). "
+                "Skipping clear -- playlist may have duplicates after import.".format(status)
+            )
+            return
+ 
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            log.warning("Could not parse files response. Skipping clear.")
+            return
+ 
+        # AzuraCast paginates as {"rows": [...], "total": N} or just a plain list
+        if isinstance(data, dict):
+            rows = data.get("rows", [])
+            total = data.get("total", 0)
+        else:
+            rows = data
+            total = len(rows)
+ 
+        for f in rows:
+            fid = f.get("id")
+            if fid is not None:
+                file_ids.append(fid)
+ 
+        if len(file_ids) >= total or len(rows) < per_page:
+            break
+        page += 1
+ 
+    if not file_ids:
+        log.info("Playlist is already empty.")
+        return
+ 
+    log.info("Clearing {} track(s) from playlist via batch API...".format(len(file_ids)))
+ 
+    # Batch update: set playlists to [] for all files currently in this playlist.
+    # AzuraCast interprets an empty playlists list as "remove from all playlists".
+    batch_payload = json.dumps({
+        "do": "playlist",
+        "files": file_ids,
+        "playlists": []
+    }).encode("utf-8")
+ 
+    batch_endpoint = "{}/api/station/{}/files/batch".format(base_url, station_id)
+    status, body = _az_request(
+        batch_endpoint, api_key,
+        method="POST", data=batch_payload,
+        content_type="application/json"
+    )
+ 
+    if status in (200, 204):
+        log.info("Playlist cleared successfully.")
+    else:
+        log.warning(
+            "Batch clear returned HTTP {}. "
+            "Playlist may still contain old tracks. Response: {}".format(status, body[:200])
+        )
+ 
+ 
 def azuracast_upload(m3u_path, az_config):
     """
-    Clear the AzuraCast playlist then import the new M3U.
-    This achieves a full overwrite rather than an append.
+    Overwrite an AzuraCast playlist with the generated M3U.
+    Clears existing contents first via the batch files API, then imports.
     """
     url         = az_config.get("url", "").rstrip("/")
     api_key     = az_config.get("api_key", "")
     station_id  = az_config.get("station_id", 0)
     playlist_id = az_config.get("playlist_id", 0)
-
+ 
     if not all([url, api_key, station_id, playlist_id]):
         log.info("AzuraCast config incomplete -- skipping upload.")
         return
-
-    # Step 1: clear existing contents
+ 
+    # Step 1: clear existing playlist contents
     azuracast_clear_playlist(url, api_key, station_id, playlist_id)
-
+ 
     # Step 2: import new M3U
     endpoint = "{}/api/station/{}/playlist/{}/import".format(
         url, station_id, playlist_id
     )
-    log.info("Importing playlist to AzuraCast: {}".format(endpoint))
-
+    log.info("Importing playlist to AzuraCast...")
+ 
     with open(m3u_path, "rb") as f:
         m3u_bytes = f.read()
-
+ 
     boundary = "----PlaylistBoundary"
     body = (
         "--{}\r\nContent-Disposition: form-data; name=\"playlist_file\";"
@@ -893,7 +937,7 @@ def azuracast_upload(m3u_path, az_config):
     ).format(boundary).encode("utf-8") \
         + m3u_bytes \
         + "\r\n--{}--\r\n".format(boundary).encode("utf-8")
-
+ 
     try:
         status, resp_body = _az_request(
             endpoint, api_key, method="POST", data=body,
@@ -912,7 +956,6 @@ def azuracast_upload(m3u_path, az_config):
             ))
     except ConnectionError as e:
         log.error(str(e))
-
 
 # ---------------------------------------------------------------------------
 # Entry point

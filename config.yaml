@@ -1,98 +1,94 @@
 # ---------------------------------------------------------------------------
 # smart_playlist config
 # ---------------------------------------------------------------------------
-
-# Path to your music library root
-library_path: /raid
-
-# Where to store the embedding database (SQLite).
-# The directory will be created automatically if it does not exist.
+ 
+library_path: /raid/active
 db_path: /app/embeddings.db
-
-# Path to the Essentia Discogs-EffNet model file.
-# The directory will be created automatically if it does not exist.
-# Download: https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb
 model_path: /models/discogs-effnet-bs64-1.pb
-
-# Output M3U file path.
-# The directory will be created automatically if it does not exist.
 output_m3u: /app/playlist.m3u
-
-# Audio file formats to scan
+ 
 audio_formats:
   - mp3
   - flac
-
+ 
 # ---------------------------------------------------------------------------
 # Playlist shape
 # ---------------------------------------------------------------------------
-
-# How many anchor songs to use per playlist run.
-# There is NO upper limit -- set this to however many you need.
-# You must have at least this many resolvable entries in the 'anchors' list below.
-# Total playlist length = num_anchors + (num_anchors - 1) * interpolation_count
-# Example: 10 anchors, 5 interpolation -> 10 + 9*5 = 55 tracks
+ 
+# No upper limit on num_anchors. Set it to however many you need.
+# Total length (no loop) = num_anchors + (num_anchors - 1) * interpolation_count
+# Total length (loop)    = num_anchors + num_anchors * interpolation_count
 num_anchors: 5
-
-# Number of interpolated songs between each consecutive pair of anchors.
+ 
 interpolation_count: 5
-
-# Interpolation strategy. Run with --list-modes for descriptions.
-#   chain     -- greedy nearest-neighbour from the previous song
-#   path      -- linear path through embedding space from A toward B  (recommended)
-#   midpoint  -- find best midpoint track then path-fill each half
-interpolation_mode: path
-
-# If true, anchor songs may also be candidates for interpolation slots in
-# other segments. If false they are fully reserved and never reused.
+ 
+# Interpolation mode. Run with --list-modes for all options.
+#   chain    -- greedy nearest-neighbour, no direction toward next anchor
+#   path     -- linear path through embedding space A -> B
+#   midpoint -- find best midpoint, path-fill each half
+#   diverse  -- RECOMMENDED: curved traversal + artist penalty (see below)
+interpolation_mode: diverse
+ 
 allow_anchors_in_pool: false
-
-# Minimum fuzzy-match score (0.0-1.0) to accept an anchor query.
-# Lower this if valid anchors are being missed. Raise it to avoid false matches.
 fuzzy_match_threshold: 0.6
-
+ 
 # ---------------------------------------------------------------------------
-# AzuraCast integration  (all fields optional -- omit or leave blank to skip)
+# Looping
 # ---------------------------------------------------------------------------
-
+ 
+# When true, interpolation tracks are added after the final anchor that
+# bridge back toward the first anchor, so the playlist loops seamlessly.
+# The bridge uses the same interpolation_mode and interpolation_count as
+# all other segments.
+loop: false
+ 
+# ---------------------------------------------------------------------------
+# Diverse mode settings
+# (only used when interpolation_mode is 'diverse')
+# ---------------------------------------------------------------------------
+ 
+# Power curve for the interpolation parameter t.
+# Values below 1.0 cause the path to jump away from anchor A's embedding
+# cluster faster at the start, reducing same-artist runs near each anchor.
+# 0.55 is a good starting point. Range: 0.3 (aggressive) to 1.0 (= linear).
+diverse_curve_power: 0.55
+ 
+# Number of top candidates to consider before applying the artist penalty.
+# Higher values give the penalty more to work with but cost a tiny bit of CPU.
+diverse_candidates: 20
+ 
+# How many recently placed artists to look back when applying the penalty.
+# The window is shared across segment boundaries so diversity is maintained
+# throughout the whole playlist, not just within each segment.
+diverse_artist_window: 3
+ 
+# Score reduction applied per occurrence of a repeated artist in the window.
+# 0.0 = no penalty (same as PathStrategy). 0.35 is a balanced default.
+# Raise toward 1.0 to more aggressively avoid artist repeats.
+diverse_artist_penalty: 0.35
+ 
+# ---------------------------------------------------------------------------
+# AzuraCast integration  (leave blank to skip upload)
+# ---------------------------------------------------------------------------
+ 
 azuracast:
-  # Base URL of your AzuraCast instance (no trailing slash)
   url: "http://192.168.1.143"
-
-  # API key -- create one at Admin > API Keys in the AzuraCast web UI
-  api_key: "809ef913c5b4fbfa:d8aea327393dec3c7431d1565170400d"
-
-  # Numeric station ID (visible in the AzuraCast URL when editing the station)
+  api_key: "809ef913c5b4fbfa:d8aea327393dec3c7431d1565170400d
   station_id: 1
-
-  # Numeric playlist ID to overwrite (visible in the AzuraCast URL when editing the playlist)
-  playlist_id: 1
-
+  playlist_id: 2
+ 
 # ---------------------------------------------------------------------------
-# Exclusions
+# Exclusions -- these tracks will never appear as interpolation picks
 # ---------------------------------------------------------------------------
-#
-# Songs listed here will never appear in the generated playlist, even if they
-# would otherwise be selected as interpolation tracks.
-# Anchor songs in this list will still be used as anchors (the exclusion only
-# applies to the interpolation pool).
-#
-# Format: "Artist - Title"  (same fuzzy-ish matching as anchors, but exact
-# lowercase string match against the stored tags, so be precise here)
-#
+ 
 exclude: []
-
+ 
 # ---------------------------------------------------------------------------
 # Anchor songs
 # ---------------------------------------------------------------------------
 #
-# Format: "Artist - Title"  (fuzzy matched against your library's audio tags)
-#
-# List MORE entries than num_anchors -- extras act as fallbacks if some do not
-# match anything in the library above the fuzzy_match_threshold.
-#
-# There is NO limit on how many anchors you can use. Set num_anchors to 20,
-# 50, 100 -- whatever you need -- and provide at least that many entries here.
+# List more entries than num_anchors -- extras are fallbacks.
+# Format: "Artist - Title"  (fuzzy matched against audio tags)
 #
 anchors:
   - "Faye Webster - I Know You"

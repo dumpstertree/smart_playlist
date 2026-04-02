@@ -51,7 +51,7 @@ loop: false
 # Values below 1.0 cause the path to jump away from anchor A's embedding
 # cluster faster at the start, reducing same-artist runs near each anchor.
 # 0.55 is a good starting point. Range: 0.3 (aggressive) to 1.0 (= linear).
-diverse_curve_power: 0.55
+diverse_curve_power: 0.9
  
 # Number of top candidates to consider before applying the artist penalty.
 # Higher values give the penalty more to work with but cost a tiny bit of CPU.
@@ -60,7 +60,7 @@ diverse_candidates: 20
 # How many recently placed artists to look back when applying the penalty.
 # The window is shared across segment boundaries so diversity is maintained
 # throughout the whole playlist, not just within each segment.
-diverse_artist_window: 3
+diverse_artist_window: 2
  
 # Score reduction applied per occurrence of a repeated artist in the window.
 # 0.0 = no penalty (same as PathStrategy). 0.35 is a balanced default.
@@ -91,9 +91,13 @@ exclude: []
 # Format: "Artist - Title"  (fuzzy matched against audio tags)
 #
 anchors:
-  - "Faye Webster - I Know You"
-  - "Mac DeMarco - Salad Days"
   - "Metric - Help I'm Alive"
   - "Chappell Roan - Pink Pony Club"
-  - "Metronomy - Sex Emoji"
-  - "MGMT - Little Dark Age"
+  - "Metronomy - Salted Carmel Ice Cream"
+  - "MGMT - She Works Out Too Much"
+  - "Empire of the Sun - Walking on a Dream"
+  - "Carly Rae Jepsen - Automatically In Love"
+  - "Carly Rae Jespsen - Emotion"
+  - "Grimes - Realiti"
+  - "Arcade Fire - Electric Blue"
+  - "M83 - Midnight City"

@@ -22,6 +22,7 @@ import sqlite3
 import hashlib
 import logging
 import argparse
+import random
 import numpy as np
 import urllib.request
 import urllib.error
@@ -81,10 +82,18 @@ DEFAULTS = {
     "interpolation_mode": "diverse",
     "allow_anchors_in_pool": False,
     "fuzzy_match_threshold": 0.6,
-    "anchors": [],
-    "exclude": [],
     "loop": False,
-    # Settings specific to the 'diverse' interpolation mode
+    # Anchor sources -- all optional, combined into one pool then randomly sampled
+    "anchor_songs": [],
+    "anchor_albums": [],
+    "anchor_artists": [],
+    "anchor_genres": [],
+    # Exclusion sources -- all optional, union of all matches is removed from pool
+    "exclude_songs": [],
+    "exclude_albums": [],
+    "exclude_artists": [],
+    "exclude_genres": [],
+    # Diverse mode tuning
     "diverse_artist_window": 3,
     "diverse_artist_penalty": 0.35,
     "diverse_curve_power": 0.55,
@@ -103,17 +112,22 @@ def load_config(path):
     with open(path, encoding="utf-8") as f:
         user = yaml.safe_load(f) or {}
 
-    # Deep-merge azuracast block so partial user config still works
     config = {**DEFAULTS, **user}
+
+    # Deep-merge azuracast block
     az_defaults = dict(DEFAULTS["azuracast"])
     az_user = user.get("azuracast", {}) or {}
     config["azuracast"] = {**az_defaults, **az_user}
 
-    # Normalise exclude to a set of lowercase stripped strings
-    config["_exclude_set"] = {s.lower().strip() for s in (config.get("exclude") or [])}
-
-    if not config["anchors"]:
-        raise ValueError("Config must contain at least one entry under 'anchors'.")
+    has_anchors = any(
+        config.get(k) for k in
+        ("anchor_songs", "anchor_albums", "anchor_artists", "anchor_genres")
+    )
+    if not has_anchors:
+        raise ValueError(
+            "Config must contain at least one anchor source:\n"
+            "  anchor_songs, anchor_albums, anchor_artists, or anchor_genres"
+        )
     if config["num_anchors"] < 2:
         raise ValueError("'num_anchors' must be at least 2.")
     if config["interpolation_count"] < 0:
@@ -123,7 +137,7 @@ def load_config(path):
 
 
 # ---------------------------------------------------------------------------
-# Database
+# Database  (schema v2 adds album + genre columns)
 # ---------------------------------------------------------------------------
 
 SCHEMA = """
@@ -131,10 +145,17 @@ CREATE TABLE IF NOT EXISTS tracks (
     path        TEXT    PRIMARY KEY,
     artist      TEXT    NOT NULL DEFAULT '',
     title       TEXT    NOT NULL DEFAULT '',
+    album       TEXT    NOT NULL DEFAULT '',
+    genre       TEXT    NOT NULL DEFAULT '',
     mtime       REAL    NOT NULL,
     file_hash   TEXT    NOT NULL,
     embedding   BLOB
 );
+"""
+
+MIGRATION = """
+ALTER TABLE tracks ADD COLUMN album TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks ADD COLUMN genre TEXT NOT NULL DEFAULT '';
 """
 
 
@@ -143,20 +164,32 @@ def init_db(db_path):
     conn = sqlite3.connect(db_path)
     conn.execute(SCHEMA)
     conn.commit()
+
+    # Migrate existing DBs that pre-date album/genre columns
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
+    if "album" not in cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN album TEXT NOT NULL DEFAULT ''")
+        log.info("DB migrated: added 'album' column.")
+    if "genre" not in cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN genre TEXT NOT NULL DEFAULT ''")
+        log.info("DB migrated: added 'genre' column.")
+    conn.commit()
     return conn
 
 
 def db_get_all(conn):
     rows = conn.execute(
-        "SELECT path, artist, title, mtime, file_hash, embedding "
+        "SELECT path, artist, title, album, genre, mtime, file_hash, embedding "
         "FROM tracks WHERE embedding IS NOT NULL"
     ).fetchall()
     result = {}
-    for path, artist, title, mtime, fhash, blob in rows:
+    for path, artist, title, album, genre, mtime, fhash, blob in rows:
         result[path] = {
             "artist": artist,
-            "title": title,
-            "mtime": mtime,
+            "title":  title,
+            "album":  album,
+            "genre":  genre,
+            "mtime":  mtime,
             "file_hash": fhash,
             "embedding": np.frombuffer(blob, dtype=np.float32).copy(),
         }
@@ -168,12 +201,13 @@ def db_get_index(conn):
     return {r[0]: {"mtime": r[1], "file_hash": r[2]} for r in rows}
 
 
-def db_upsert(conn, path, artist, title, mtime, fhash, embedding):
+def db_upsert(conn, path, artist, title, album, genre, mtime, fhash, embedding):
     blob = embedding.astype(np.float32).tobytes() if embedding is not None else None
     conn.execute(
-        "INSERT OR REPLACE INTO tracks (path, artist, title, mtime, file_hash, embedding) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (path, artist, title, mtime, fhash, blob),
+        "INSERT OR REPLACE INTO tracks "
+        "(path, artist, title, album, genre, mtime, file_hash, embedding) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (path, artist, title, album, genre, mtime, fhash, blob),
     )
     conn.commit()
 
@@ -195,15 +229,18 @@ def quick_hash(path):
 
 
 def read_tags(path):
+    """Return (artist, title, album, genre) from audio tags."""
     try:
         tags = MutagenFile(path, easy=True)
         if tags is None:
-            return ("", Path(path).stem)
+            return ("", Path(path).stem, "", "")
         artist = str((tags.get("artist") or [""])[0])
-        title = str((tags.get("title") or [""])[0]) or Path(path).stem
-        return (artist, title)
+        title  = str((tags.get("title")  or [""])[0]) or Path(path).stem
+        album  = str((tags.get("album")  or [""])[0])
+        genre  = str((tags.get("genre")  or [""])[0])
+        return (artist, title, album, genre)
     except Exception:
-        return ("", Path(path).stem)
+        return ("", Path(path).stem, "", "")
 
 
 def scan_library(library_path, formats):
@@ -217,25 +254,178 @@ def scan_library(library_path, formats):
 
 
 # ---------------------------------------------------------------------------
-# Exclusion helpers
+# Fuzzy matching helpers
 # ---------------------------------------------------------------------------
 
-def is_excluded(path, info, exclude_set):
-    if not exclude_set:
+def _fuzzy(a, b):
+    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+
+def _best_fuzzy_score(query, candidates):
+    """Return the highest fuzzy score between query and any string in candidates."""
+    if not candidates:
+        return 0.0
+    return max(_fuzzy(query, c) for c in candidates if c)
+
+
+def matches_song(query, info, threshold):
+    """Match 'Artist - Title' against a track's tags."""
+    candidate = "{} - {}".format(info["artist"], info["title"])
+    return _fuzzy(query, candidate) >= threshold
+
+
+def matches_artist(query, info, threshold):
+    return bool(info["artist"]) and _fuzzy(query, info["artist"]) >= threshold
+
+
+def matches_album(query, info, threshold):
+    """Match 'Artist - Album' or plain album name."""
+    if not info["album"]:
         return False
-    candidate_full = "{} - {}".format(info["artist"], info["title"]).lower().strip()
-    candidate_file = Path(path).stem.lower().strip()
-    return candidate_full in exclude_set or candidate_file in exclude_set
+    full = "{} - {}".format(info["artist"], info["album"])
+    return _fuzzy(query, full) >= threshold or _fuzzy(query, info["album"]) >= threshold
 
 
-def apply_exclusions(tracks, exclude_set):
-    if not exclude_set:
-        return tracks
-    filtered = {p: t for p, t in tracks.items() if not is_excluded(p, t, exclude_set)}
-    removed = len(tracks) - len(filtered)
-    if removed:
-        log.info("Excluded {} track(s) from the playlist pool.".format(removed))
-    return filtered
+def matches_genre(query, info, threshold):
+    """Match against the genre tag; supports comma/slash separated multi-genre fields."""
+    raw = info.get("genre", "")
+    if not raw:
+        return False
+    parts = [g.strip() for g in raw.replace("/", ",").split(",") if g.strip()]
+    return _best_fuzzy_score(query, parts) >= threshold
+
+
+# ---------------------------------------------------------------------------
+# Anchor pool builder
+# ---------------------------------------------------------------------------
+
+def build_anchor_pool(config, tracks):
+    """
+    Compile the full set of candidate anchor tracks from all anchor_* lists.
+    Returns a list of paths (may contain duplicates if a track matches multiple
+    criteria -- deduplicated before returning).
+    """
+    threshold = config.get("fuzzy_match_threshold", 0.6)
+    pool = set()
+
+    # anchor_songs
+    for query in (config.get("anchor_songs") or []):
+        matched = [p for p, info in tracks.items() if matches_song(query, info, threshold)]
+        if matched:
+            pool.update(matched)
+            log.info("  anchor_song '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  anchor_song '{}' -> no match".format(query))
+
+    # anchor_artists
+    for query in (config.get("anchor_artists") or []):
+        matched = [p for p, info in tracks.items() if matches_artist(query, info, threshold)]
+        if matched:
+            pool.update(matched)
+            log.info("  anchor_artist '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  anchor_artist '{}' -> no match".format(query))
+
+    # anchor_albums
+    for query in (config.get("anchor_albums") or []):
+        matched = [p for p, info in tracks.items() if matches_album(query, info, threshold)]
+        if matched:
+            pool.update(matched)
+            log.info("  anchor_album '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  anchor_album '{}' -> no match".format(query))
+
+    # anchor_genres
+    for query in (config.get("anchor_genres") or []):
+        matched = [p for p, info in tracks.items() if matches_genre(query, info, threshold)]
+        if matched:
+            pool.update(matched)
+            log.info("  anchor_genre '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  anchor_genre '{}' -> no match".format(query))
+
+    return list(pool)
+
+
+def resolve_anchors(config, tracks):
+    """
+    Build the full anchor candidate pool from all anchor_* sources,
+    then randomly sample num_anchors from it.
+    Raises ValueError if the pool is too small to satisfy num_anchors.
+    """
+    num_wanted = config["num_anchors"]
+
+    log.info("Building anchor pool...")
+    pool = build_anchor_pool(config, tracks)
+
+    if len(pool) < num_wanted:
+        raise ValueError(
+            "Anchor pool too small.\n"
+            "  Needed : {}\n"
+            "  Found  : {}\n"
+            "Add more entries to anchor_songs / anchor_artists / "
+            "anchor_albums / anchor_genres.".format(num_wanted, len(pool))
+        )
+
+    chosen = random.sample(pool, num_wanted)
+    log.info("Anchor pool: {} candidates, {} randomly selected.".format(
+        len(pool), num_wanted
+    ))
+    for path in chosen:
+        info = tracks[path]
+        log.info("  Anchor: {} - {} [{}]".format(
+            info["artist"], info["title"], info["album"]
+        ))
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# Exclusion builder
+# ---------------------------------------------------------------------------
+
+def build_exclude_set(config, tracks):
+    """
+    Compile the full set of paths to exclude from the interpolation pool.
+    Returns a set of paths.
+    """
+    threshold = config.get("fuzzy_match_threshold", 0.6)
+    excluded = set()
+
+    for query in (config.get("exclude_songs") or []):
+        matched = [p for p, info in tracks.items() if matches_song(query, info, threshold)]
+        if matched:
+            excluded.update(matched)
+            log.info("  exclude_song '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  exclude_song '{}' -> no match".format(query))
+
+    for query in (config.get("exclude_artists") or []):
+        matched = [p for p, info in tracks.items() if matches_artist(query, info, threshold)]
+        if matched:
+            excluded.update(matched)
+            log.info("  exclude_artist '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  exclude_artist '{}' -> no match".format(query))
+
+    for query in (config.get("exclude_albums") or []):
+        matched = [p for p, info in tracks.items() if matches_album(query, info, threshold)]
+        if matched:
+            excluded.update(matched)
+            log.info("  exclude_album '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  exclude_album '{}' -> no match".format(query))
+
+    for query in (config.get("exclude_genres") or []):
+        matched = [p for p, info in tracks.items() if matches_genre(query, info, threshold)]
+        if matched:
+            excluded.update(matched)
+            log.info("  exclude_genre '{}' -> {} track(s)".format(query, len(matched)))
+        else:
+            log.warning("  exclude_genre '{}' -> no match".format(query))
+
+    if excluded:
+        log.info("Total excluded from interpolation pool: {} track(s).".format(len(excluded)))
+    return excluded
 
 
 # ---------------------------------------------------------------------------
@@ -278,13 +468,13 @@ def compute_embedding(path, model):
 
 def sync_library(conn, config):
     library_path = config["library_path"]
-    formats = config["audio_formats"]
-    model_path = config["model_path"]
+    formats      = config["audio_formats"]
+    model_path   = config["model_path"]
 
     log.info("Scanning library: {}".format(library_path))
     disk_files = set(scan_library(library_path, formats))
-    db_index = db_get_index(conn)
-    db_files = set(db_index.keys())
+    db_index   = db_get_index(conn)
+    db_files   = set(db_index.keys())
 
     for path in db_files - disk_files:
         log.info("  Removing (deleted): {}".format(os.path.basename(path)))
@@ -304,74 +494,15 @@ def sync_library(conn, config):
         model = load_model(model_path)
         for i, path in enumerate(to_analyze, 1):
             log.info("  [{}/{}] {}".format(i, len(to_analyze), os.path.basename(path)))
-            artist, title = read_tags(path)
-            mtime = os.path.getmtime(path)
-            fhash = quick_hash(path)
-            emb = compute_embedding(path, model)
-            db_upsert(conn, path, artist, title, mtime, fhash, emb)
+            artist, title, album, genre = read_tags(path)
+            mtime  = os.path.getmtime(path)
+            fhash  = quick_hash(path)
+            emb    = compute_embedding(path, model)
+            db_upsert(conn, path, artist, title, album, genre, mtime, fhash, emb)
     else:
         log.info("Library is up to date -- no analysis needed.")
 
     return db_get_all(conn)
-
-
-# ---------------------------------------------------------------------------
-# Fuzzy matching
-# ---------------------------------------------------------------------------
-
-def _fuzzy(a, b):
-    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
-
-
-def resolve_anchor(query, tracks, threshold, exclude):
-    best_path = None
-    best_score = 0.0
-    for path, info in tracks.items():
-        if path in exclude:
-            continue
-        candidate = "{} - {}".format(info["artist"], info["title"])
-        score = _fuzzy(query, candidate)
-        if score > best_score:
-            best_score = score
-            best_path = path
-    return best_path if best_score >= threshold else None
-
-
-def resolve_anchors(config, tracks):
-    """
-    Resolve anchor queries against the library.
-    There is NO upper limit on num_anchors.
-    """
-    num_wanted = config["num_anchors"]
-    threshold = config.get("fuzzy_match_threshold", 0.6)
-    resolved = []
-    failed = []
-
-    for query in config["anchors"]:
-        path = resolve_anchor(query, tracks, threshold, exclude=set(resolved))
-        if path:
-            resolved.append(path)
-            log.info("  Anchor OK  '{}'  ->  {} - {}".format(
-                query, tracks[path]["artist"], tracks[path]["title"]
-            ))
-            if len(resolved) == num_wanted:
-                break
-        else:
-            failed.append(query)
-            log.warning("  Anchor MISS '{}' (no match above threshold {})".format(
-                query, threshold
-            ))
-
-    if len(resolved) < num_wanted:
-        raise ValueError(
-            "Could not resolve enough anchors.\n"
-            "  Needed : {}\n"
-            "  Found  : {}\n"
-            "  Failed : {}\n"
-            "Add more entries to 'anchors' in your config, "
-            "or lower 'fuzzy_match_threshold'.".format(num_wanted, len(resolved), failed)
-        )
-    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +515,6 @@ def cosine_sim(a, b):
 
 
 def nearest_to(target, pool, exclude, n=1):
-    """Return the n paths from pool (minus exclude) closest to target."""
     scores = [
         (cosine_sim(target, info["embedding"]), path)
         for path, info in pool.items()
@@ -399,36 +529,10 @@ def nearest_to(target, pool, exclude, n=1):
 # ---------------------------------------------------------------------------
 
 class InterpolationStrategy(ABC):
-    """
-    Base class for interpolation strategies.
-    To add a new mode: subclass this, implement fill(), register in STRATEGIES.
-    """
-
     @abstractmethod
     def fill(self, anchor_a, anchor_b, count, tracks, pool, used, config,
              recent_artists=None):
-        """
-        Return a list of `count` track paths to insert between anchor_a and anchor_b.
-
-        Parameters
-        ----------
-        anchor_a, anchor_b : str
-            Paths of the surrounding anchor tracks.
-        count : int
-            Number of tracks to insert.
-        tracks : dict
-            Full library {path: info} including embeddings.
-        pool : dict
-            Candidate tracks eligible for interpolation.
-        used : set
-            Globally used paths -- never pick these.
-        config : dict
-            Full config dict (strategies may read their own settings from it).
-        recent_artists : list or None
-            Ordered list of recently placed artist strings, most recent last.
-            Strategies that implement artist diversity should extend this list
-            as they make picks so the next segment inherits accurate history.
-        """
+        pass
 
     @staticmethod
     def _emb(path, tracks):
@@ -440,7 +544,6 @@ class ChainStrategy(InterpolationStrategy):
     Greedy nearest-neighbour chain.
     Each song is chosen as the closest unused track to the previous song,
     with no directional pull toward anchor_b.
-    Best for: smooth organic flow from A where you don't care about arriving at B.
     """
 
     def fill(self, anchor_a, anchor_b, count, tracks, pool, used, config,
@@ -462,22 +565,20 @@ class ChainStrategy(InterpolationStrategy):
 class PathStrategy(InterpolationStrategy):
     """
     Linear embedding interpolation.
-    Evenly spaces `count` target points along the straight line in embedding
-    space from A to B, then picks the closest unused track to each point.
-    Best for: intentional audible journey from A's sound toward B's sound.
+    Evenly spaces target points along the line from A to B in embedding space.
     """
 
     def fill(self, anchor_a, anchor_b, count, tracks, pool, used, config,
              recent_artists=None):
-        emb_a = self._emb(anchor_a, tracks)
-        emb_b = self._emb(anchor_b, tracks)
-        result = []
+        emb_a    = self._emb(anchor_a, tracks)
+        emb_b    = self._emb(anchor_b, tracks)
+        result   = []
         local_used = set()
 
         for i in range(1, count + 1):
-            t = i / (count + 1)
+            t      = i / (count + 1)
             target = (1.0 - t) * emb_a + t * emb_b
-            picks = nearest_to(target, pool, used | local_used)
+            picks  = nearest_to(target, pool, used | local_used)
             if not picks:
                 break
             chosen = picks[0]
@@ -485,16 +586,13 @@ class PathStrategy(InterpolationStrategy):
             local_used.add(chosen)
             if recent_artists is not None:
                 recent_artists.append(tracks[chosen]["artist"])
-
         return result
 
 
 class MidpointStrategy(InterpolationStrategy):
     """
     Midpoint anchor + symmetric path fill.
-    Finds the best track for the midpoint between A and B, then fills
-    the first half as a path from A to midpoint and second half from midpoint to B.
-    Best for: playlists with a clear peak or pivot in the middle of each segment.
+    Finds the best midpoint track then path-fills each half independently.
     """
 
     def fill(self, anchor_a, anchor_b, count, tracks, pool, used, config,
@@ -502,9 +600,9 @@ class MidpointStrategy(InterpolationStrategy):
         if count == 0:
             return []
 
-        emb_a = self._emb(anchor_a, tracks)
-        emb_b = self._emb(anchor_b, tracks)
-        mid_emb = (emb_a + emb_b) / 2.0
+        emb_a    = self._emb(anchor_a, tracks)
+        emb_b    = self._emb(anchor_b, tracks)
+        mid_emb  = (emb_a + emb_b) / 2.0
         local_used = set()
 
         mid_picks = nearest_to(mid_emb, pool, used | local_used)
@@ -513,26 +611,24 @@ class MidpointStrategy(InterpolationStrategy):
         mid_track = mid_picks[0]
         local_used.add(mid_track)
 
-        remaining = count - 1
+        remaining   = count - 1
         half_before = remaining // 2
-        half_after = remaining - half_before
+        half_after  = remaining - half_before
 
         before = []
         for i in range(1, half_before + 1):
-            t = i / (half_before + 1)
+            t      = i / (half_before + 1)
             target = (1.0 - t) * emb_a + t * self._emb(mid_track, tracks)
-            picks = nearest_to(target, pool, used | local_used | set(before))
+            picks  = nearest_to(target, pool, used | local_used | set(before))
             if not picks:
                 break
             before.append(picks[0])
 
         after = []
         for i in range(1, half_after + 1):
-            t = i / (half_after + 1)
+            t      = i / (half_after + 1)
             target = (1.0 - t) * self._emb(mid_track, tracks) + t * emb_b
-            picks = nearest_to(
-                target, pool, used | local_used | set(before) | set(after)
-            )
+            picks  = nearest_to(target, pool, used | local_used | set(before) | set(after))
             if not picks:
                 break
             after.append(picks[0])
@@ -547,70 +643,43 @@ class MidpointStrategy(InterpolationStrategy):
 class DiverseStrategy(InterpolationStrategy):
     """
     Curved traversal + artist penalty. Recommended default.
-    Combines two techniques to prevent same-artist clustering:
-
-    1. Curved traversal: uses a configurable power curve for the interpolation
-       parameter t, so the path moves away from anchor A's embedding cluster
-       faster than plain linear interpolation does.
-
-    2. Artist penalty: scores the top-N candidates for each slot and applies
-       a penalty to any track whose artist appears in the recent history window.
-       This breaks up runs of the same artist without hard-banning them.
-
-    Config keys (all optional, with defaults shown):
-        diverse_curve_power    : 0.55  -- <1.0 curves away from A faster;
-                                          1.0 = linear (same as PathStrategy)
-        diverse_candidates     : 20    -- top-N candidates to score before
-                                          applying the artist penalty re-ranking
-        diverse_artist_window  : 3     -- how many recently placed artists to
-                                          consider when applying the penalty
-        diverse_artist_penalty : 0.35  -- score reduction per occurrence in the
-                                          recent window (0.0 = no penalty,
-                                          1.0 = effectively banned)
+    Moves away from anchor A faster (curve_power < 1.0) and penalises
+    recently played artists to break up same-artist clustering.
     """
 
     def fill(self, anchor_a, anchor_b, count, tracks, pool, used, config,
              recent_artists=None):
-        emb_a = self._emb(anchor_a, tracks)
-        emb_b = self._emb(anchor_b, tracks)
+        emb_a    = self._emb(anchor_a, tracks)
+        emb_b    = self._emb(anchor_b, tracks)
 
         curve_power    = float(config.get("diverse_curve_power",    0.55))
         n_candidates   = int(config.get("diverse_candidates",       20))
         artist_window  = int(config.get("diverse_artist_window",    3))
         artist_penalty = float(config.get("diverse_artist_penalty", 0.35))
 
-        # recent_artists is shared with the caller so cross-segment history works
         if recent_artists is None:
             recent_artists = []
 
-        # Seed the window with the anchor A artist so the very first pick
-        # is already discouraged from matching the opening anchor's artist.
         recent_artists.append(tracks[anchor_a]["artist"])
 
-        result = []
+        result     = []
         local_used = set()
 
         for i in range(1, count + 1):
-            # Curved t: power < 1.0 means we jump away from A's cluster faster
             t_linear = i / (count + 1)
-            t = t_linear ** curve_power
+            t        = t_linear ** curve_power
+            target   = (1.0 - t) * emb_a + t * emb_b
 
-            target = (1.0 - t) * emb_a + t * emb_b
-
-            # Get top-N candidates by raw cosine similarity
             candidates = nearest_to(target, pool, used | local_used, n=n_candidates)
             if not candidates:
                 break
 
-            # Re-rank: apply artist penalty based on recent history window
             window = recent_artists[-artist_window:] if artist_window > 0 else []
 
             def score(path):
-                raw = cosine_sim(target, tracks[path]["embedding"])
+                raw    = cosine_sim(target, tracks[path]["embedding"])
                 artist = tracks[path]["artist"].lower().strip()
-                hits = sum(
-                    1 for a in window if a.lower().strip() == artist
-                )
+                hits   = sum(1 for a in window if a.lower().strip() == artist)
                 return raw - (artist_penalty * hits)
 
             best = max(candidates, key=score)
@@ -621,7 +690,6 @@ class DiverseStrategy(InterpolationStrategy):
         return result
 
 
-# Registry -- add new strategies here without touching any other code
 STRATEGIES = {
     "chain":    ChainStrategy(),
     "path":     PathStrategy(),
@@ -646,9 +714,13 @@ def build_playlist(config, tracks):
         )
     strategy = STRATEGIES[mode]
 
-    # Apply exclusions before building
-    exclude_set = config.get("_exclude_set", set())
-    tracks = apply_exclusions(tracks, exclude_set)
+    log.info("Building exclusion set...")
+    exclude_set = build_exclude_set(config, tracks)
+
+    # Remove excluded tracks from the pool available for interpolation.
+    # Anchors may still come from excluded tracks if they were matched via
+    # anchor_songs/artists/albums/genres -- exclusions only affect the fill pool.
+    fill_pool = {p: t for p, t in tracks.items() if p not in exclude_set}
 
     log.info("Resolving anchors  (mode={}, interpolation_count={}, loop={})".format(
         mode, count, loop
@@ -657,19 +729,15 @@ def build_playlist(config, tracks):
 
     anchor_set = set(anchors)
     pool = (
-        tracks
+        fill_pool
         if config.get("allow_anchors_in_pool", False)
-        else {p: t for p, t in tracks.items() if p not in anchor_set}
+        else {p: t for p, t in fill_pool.items() if p not in anchor_set}
     )
 
-    used = set(anchors)
-    playlist = []
-
-    # Shared recent-artist history so artist diversity is maintained across
-    # segment boundaries, not just within a single segment.
+    used           = set(anchors)
+    playlist       = []
     recent_artists = []
 
-    # Build segments between consecutive anchors
     for i in range(len(anchors) - 1):
         a, b = anchors[i], anchors[i + 1]
         playlist.append(a)
@@ -681,41 +749,36 @@ def build_playlist(config, tracks):
             tracks[b]["artist"], tracks[b]["title"],
         ))
 
-        interp = strategy.fill(
-            a, b, count, tracks, pool, used, config, recent_artists
-        )
+        interp = strategy.fill(a, b, count, tracks, pool, used, config, recent_artists)
 
         if len(interp) < count:
-            log.warning("    Only found {}/{} interpolation tracks "
-                        "(pool may be exhausted).".format(len(interp), count))
+            log.warning("    Only found {}/{} interpolation tracks.".format(
+                len(interp), count
+            ))
 
         used.update(interp)
         playlist.extend(interp)
 
-    # Final anchor
     playlist.append(anchors[-1])
     recent_artists.append(tracks[anchors[-1]]["artist"])
 
-    # Loop segment: interpolate from last anchor back to first
     if loop and len(anchors) >= 2:
         a = anchors[-1]
         b = anchors[0]
-        log.info("  Loop segment: {} - {}  ->  {} - {}  (back to start)".format(
+        log.info("  Loop segment: {} - {}  ->  {} - {}".format(
             tracks[a]["artist"], tracks[a]["title"],
             tracks[b]["artist"], tracks[b]["title"],
         ))
-
         loop_interp = strategy.fill(
             a, b, count, tracks, pool, used, config, recent_artists
         )
-
         if len(loop_interp) < count:
-            log.warning("    Loop segment: only found {}/{} interpolation tracks "
-                        "(pool may be exhausted).".format(len(loop_interp), count))
-
+            log.warning("    Loop segment: only found {}/{} interpolation tracks.".format(
+                len(loop_interp), count
+            ))
         used.update(loop_interp)
         playlist.extend(loop_interp)
-        log.info("  Loop bridge added: {} tracks.".format(len(loop_interp)))
+        log.info("  Loop bridge: {} track(s) added.".format(len(loop_interp)))
 
     log.info("Playlist complete: {} tracks total.".format(len(playlist)))
     return playlist
@@ -730,10 +793,10 @@ def write_m3u(playlist, tracks, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
         for path in playlist:
-            info = tracks.get(path, {})
+            info   = tracks.get(path, {})
             artist = info.get("artist", "")
-            title = info.get("title", os.path.basename(path))
-            label = "{} - {}".format(artist, title) if artist else title
+            title  = info.get("title", os.path.basename(path))
+            label  = "{} - {}".format(artist, title) if artist else title
             f.write("#EXTINF:-1,{}\n{}\n".format(label, path))
     log.info("M3U written -> {}  ({} tracks)".format(output_path, len(playlist)))
 
@@ -742,66 +805,113 @@ def write_m3u(playlist, tracks, output_path):
 # AzuraCast upload
 # ---------------------------------------------------------------------------
 
+def _az_request(endpoint, api_key, method="GET", data=None, content_type=None):
+    """Make a request to the AzuraCast API, return (status_code, body_str)."""
+    headers = {"X-API-Key": api_key}
+    if content_type:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(endpoint, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        raise ConnectionError("AzuraCast connection error: {}".format(e.reason))
+
+
+def azuracast_clear_playlist(base_url, api_key, station_id, playlist_id):
+    """
+    Empty a playlist by fetching all its song entries and deleting them in bulk.
+    AzuraCast does not have a single-call "clear" endpoint, so we:
+      1. GET all media items currently in the playlist
+      2. DELETE each one by its playlist-song relationship ID
+    """
+    endpoint = "{}/api/station/{}/playlist/{}/songs".format(
+        base_url, station_id, playlist_id
+    )
+    status, body = _az_request(endpoint, api_key)
+    if status != 200:
+        log.warning("Could not fetch playlist songs (HTTP {}). Skipping clear.".format(status))
+        return
+
+    try:
+        songs = json.loads(body)
+    except json.JSONDecodeError:
+        log.warning("Could not parse playlist songs response. Skipping clear.")
+        return
+
+    if not songs:
+        log.info("Playlist already empty.")
+        return
+
+    log.info("Clearing {} existing track(s) from playlist...".format(len(songs)))
+    for song in songs:
+        song_id = song.get("id")
+        if not song_id:
+            continue
+        del_endpoint = "{}/api/station/{}/playlist/{}/song/{}".format(
+            base_url, station_id, playlist_id, song_id
+        )
+        s, _ = _az_request(del_endpoint, api_key, method="DELETE")
+        if s not in (200, 204):
+            log.warning("  Failed to delete song id {} (HTTP {})".format(song_id, s))
+
+    log.info("Playlist cleared.")
+
+
 def azuracast_upload(m3u_path, az_config):
     """
-    Import the generated M3U into an AzuraCast playlist via the REST API.
+    Clear the AzuraCast playlist then import the new M3U.
+    This achieves a full overwrite rather than an append.
     """
-    url        = az_config.get("url", "").rstrip("/")
-    api_key    = az_config.get("api_key", "")
-    station_id = az_config.get("station_id", 0)
+    url         = az_config.get("url", "").rstrip("/")
+    api_key     = az_config.get("api_key", "")
+    station_id  = az_config.get("station_id", 0)
     playlist_id = az_config.get("playlist_id", 0)
 
     if not all([url, api_key, station_id, playlist_id]):
         log.info("AzuraCast config incomplete -- skipping upload.")
         return
 
+    # Step 1: clear existing contents
+    azuracast_clear_playlist(url, api_key, station_id, playlist_id)
+
+    # Step 2: import new M3U
     endpoint = "{}/api/station/{}/playlist/{}/import".format(
         url, station_id, playlist_id
     )
-
-    log.info("Uploading playlist to AzuraCast: {}".format(endpoint))
+    log.info("Importing playlist to AzuraCast: {}".format(endpoint))
 
     with open(m3u_path, "rb") as f:
         m3u_bytes = f.read()
 
     boundary = "----PlaylistBoundary"
     body = (
-        "--{}\r\n"
-        "Content-Disposition: form-data; name=\"playlist_file\";"
-        " filename=\"playlist.m3u\"\r\n"
-        "Content-Type: audio/x-mpegurl\r\n"
-        "\r\n"
-    ).format(boundary).encode("utf-8") + m3u_bytes + \
-        "\r\n--{}--\r\n".format(boundary).encode("utf-8")
-
-    req = urllib.request.Request(
-        endpoint,
-        data=body,
-        method="POST",
-        headers={
-            "X-API-Key": api_key,
-            "Content-Type": "multipart/form-data; boundary={}".format(boundary),
-        },
-    )
+        "--{}\r\nContent-Disposition: form-data; name=\"playlist_file\";"
+        " filename=\"playlist.m3u\"\r\nContent-Type: audio/x-mpegurl\r\n\r\n"
+    ).format(boundary).encode("utf-8") \
+        + m3u_bytes \
+        + "\r\n--{}--\r\n".format(boundary).encode("utf-8")
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            try:
-                result = json.loads(raw)
-                found   = result.get("files_found", "?")
-                success = result.get("files_success", "?")
-                log.info("AzuraCast upload complete: {}/{} tracks imported.".format(
-                    success, found
-                ))
-            except json.JSONDecodeError:
-                log.info("AzuraCast upload complete: {}".format(raw[:200]))
-    except urllib.error.HTTPError as e:
-        log.error("AzuraCast HTTP error {}: {}".format(
-            e.code, e.read().decode("utf-8", errors="replace")
-        ))
-    except urllib.error.URLError as e:
-        log.error("AzuraCast connection error: {}".format(e.reason))
+        status, resp_body = _az_request(
+            endpoint, api_key, method="POST", data=body,
+            content_type="multipart/form-data; boundary={}".format(boundary)
+        )
+        try:
+            result  = json.loads(resp_body)
+            found   = result.get("files_found", "?")
+            success = result.get("files_success", "?")
+            log.info("AzuraCast import complete: {}/{} tracks matched.".format(
+                success, found
+            ))
+        except json.JSONDecodeError:
+            log.info("AzuraCast import response (HTTP {}): {}".format(
+                status, resp_body[:200]
+            ))
+    except ConnectionError as e:
+        log.error(str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -815,31 +925,17 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        "config",
-        nargs="?",
-        default="config.yaml",
+        "config", nargs="?", default="config.yaml",
         help="Path to YAML config file (default: config.yaml)",
     )
-    parser.add_argument(
-        "--sync-only",
-        action="store_true",
-        help="Sync the library embeddings and exit without generating a playlist.",
-    )
-    parser.add_argument(
-        "--upload-only",
-        action="store_true",
-        help="Skip generation and just upload the existing M3U to AzuraCast.",
-    )
-    parser.add_argument(
-        "--list-modes",
-        action="store_true",
-        help="Print available interpolation modes and exit.",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable debug logging.",
-    )
+    parser.add_argument("--sync-only",   action="store_true",
+                        help="Sync embeddings then exit.")
+    parser.add_argument("--upload-only", action="store_true",
+                        help="Upload existing M3U to AzuraCast without regenerating.")
+    parser.add_argument("--list-modes",  action="store_true",
+                        help="Print available interpolation modes and exit.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable debug logging.")
     args = parser.parse_args()
 
     if args.verbose:
@@ -848,8 +944,8 @@ def main():
     if args.list_modes:
         print("Available interpolation modes:")
         for name, strat in STRATEGIES.items():
-            first_line = strat.__class__.__doc__.strip().splitlines()[0]
-            print("  {:12s}  {}".format(name, first_line))
+            first = strat.__class__.__doc__.strip().splitlines()[0]
+            print("  {:12s}  {}".format(name, first))
         sys.exit(0)
 
     if not os.path.exists(args.config):
@@ -865,9 +961,7 @@ def main():
     if args.upload_only:
         m3u = config["output_m3u"]
         if not os.path.exists(m3u):
-            log.error(
-                "M3U not found at '{}' -- run without --upload-only first.".format(m3u)
-            )
+            log.error("M3U not found at '{}'. Run without --upload-only first.".format(m3u))
             sys.exit(1)
         azuracast_upload(m3u, config["azuracast"])
         return
@@ -876,9 +970,7 @@ def main():
     tracks = sync_library(conn, config)
 
     if not tracks:
-        log.error(
-            "No tracks with embeddings found. Check library_path and audio_formats."
-        )
+        log.error("No tracks with embeddings found. Check library_path and audio_formats.")
         sys.exit(1)
 
     log.info("Library ready: {} tracks with embeddings.".format(len(tracks)))

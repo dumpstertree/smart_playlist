@@ -1,96 +1,74 @@
 # ---------------------------------------------------------------------------
 # smart_playlist config
 # ---------------------------------------------------------------------------
- 
+
 library_path: /raid/active
 db_path: /app/embeddings.db
 model_path: /models/discogs-effnet-bs64-1.pb
 output_m3u: /app/playlist.m3u
- 
+
 audio_formats:
   - mp3
   - flac
- 
+
 # ---------------------------------------------------------------------------
 # Playlist shape
 # ---------------------------------------------------------------------------
- 
-# No upper limit on num_anchors. Set it to however many you need.
-# Total length (no loop) = num_anchors + (num_anchors - 1) * interpolation_count
-# Total length (loop)    = num_anchors + num_anchors * interpolation_count
-num_anchors: 5
- 
-interpolation_count: 5
- 
-# Interpolation mode. Run with --list-modes for all options.
-#   chain    -- greedy nearest-neighbour, no direction toward next anchor
-#   path     -- linear path through embedding space A -> B
-#   midpoint -- find best midpoint, path-fill each half
-#   diverse  -- RECOMMENDED: curved traversal + artist penalty (see below)
+
+# No upper limit. Total length (no loop) = num_anchors + (num_anchors-1) * interpolation_count
+num_anchors: 10
+interpolation_count: 10
+
+# diverse = recommended. Run --list-modes for all options.
 interpolation_mode: diverse
- 
+
 allow_anchors_in_pool: true
 fuzzy_match_threshold: 0.6
- 
+
 # ---------------------------------------------------------------------------
 # Looping
 # ---------------------------------------------------------------------------
- 
-# When true, interpolation tracks are added after the final anchor that
-# bridge back toward the first anchor, so the playlist loops seamlessly.
-# The bridge uses the same interpolation_mode and interpolation_count as
-# all other segments.
+
+# When true, a bridge segment is added after the final anchor that
+# interpolates back to the first anchor for seamless looping.
 loop: true
- 
+
 # ---------------------------------------------------------------------------
-# Diverse mode settings
-# (only used when interpolation_mode is 'diverse')
+# Diverse mode tuning
 # ---------------------------------------------------------------------------
- 
-# Power curve for the interpolation parameter t.
-# Values below 1.0 cause the path to jump away from anchor A's embedding
-# cluster faster at the start, reducing same-artist runs near each anchor.
-# 0.55 is a good starting point. Range: 0.3 (aggressive) to 1.0 (= linear).
+
 diverse_curve_power: 0.9
- 
-# Number of top candidates to consider before applying the artist penalty.
-# Higher values give the penalty more to work with but cost a tiny bit of CPU.
 diverse_candidates: 20
- 
-# How many recently placed artists to look back when applying the penalty.
-# The window is shared across segment boundaries so diversity is maintained
-# throughout the whole playlist, not just within each segment.
-diverse_artist_window: 2
- 
-# Score reduction applied per occurrence of a repeated artist in the window.
-# 0.0 = no penalty (same as PathStrategy). 0.35 is a balanced default.
-# Raise toward 1.0 to more aggressively avoid artist repeats.
+diverse_artist_window: 3
 diverse_artist_penalty: 0.35
- 
+
 # ---------------------------------------------------------------------------
-# AzuraCast integration  (leave blank to skip upload)
+# AzuraCast integration
 # ---------------------------------------------------------------------------
- 
+# The playlist will be CLEARED then re-imported on every run (full overwrite).
+# Leave url blank to skip upload entirely.
+
 azuracast:
   url: "http://192.168.1.143"
   api_key: "809ef913c5b4fbfa:d8aea327393dec3c7431d1565170400d"
   station_id: 1
   playlist_id: 2
- 
+
 # ---------------------------------------------------------------------------
-# Exclusions -- these tracks will never appear as interpolation picks
+# Anchor sources
 # ---------------------------------------------------------------------------
- 
-exclude: []
- 
-# ---------------------------------------------------------------------------
-# Anchor songs
-# ---------------------------------------------------------------------------
+# All four lists are combined into one candidate pool, then num_anchors
+# tracks are randomly selected from that pool.
 #
-# List more entries than num_anchors -- extras are fallbacks.
-# Format: "Artist - Title"  (fuzzy matched against audio tags)
+# anchor_songs  : "Artist - Title"   -- adds that one track
+# anchor_artists: "Artist Name"      -- adds ALL tracks by that artist
+# anchor_albums : "Artist - Album"   -- adds ALL tracks on that album
+# anchor_genres : "Genre Name"       -- adds ALL tracks with that genre tag
 #
-anchors:
+# Matching is fuzzy (uses fuzzy_match_threshold above).
+# List more sources than you need -- the random selection handles the rest.
+
+anchor_songs:
   - "Metric - Help I'm Alive"
   - "Chappell Roan - Pink Pony Club"
   - "Metronomy - Salted Carmel Ice Cream"
@@ -101,3 +79,21 @@ anchors:
   - "Grimes - Realiti"
   - "Arcade Fire - Electric Blue"
   - "M83 - Midnight City"
+
+anchor_artists: []
+anchor_albums: []
+anchor_genres: []
+
+# ---------------------------------------------------------------------------
+# Exclusions
+# ---------------------------------------------------------------------------
+# Works identically to anchors -- each list adds all matching tracks to the
+# exclusion set. Excluded tracks are removed from the interpolation pool
+# (they can still appear as anchors if matched via the anchor lists above).
+#
+# Matching is fuzzy (uses fuzzy_match_threshold above).
+
+exclude_songs: []
+exclude_artists: []
+exclude_albums: []
+exclude_genres: []

@@ -805,158 +805,165 @@ def write_m3u(playlist, tracks, output_path):
 # AzuraCast upload
 # ---------------------------------------------------------------------------
 
-def _az_request(endpoint, api_key, method="GET", data=None, content_type=None):
-    """Make a request to the AzuraCast API, return (status_code, body_str)."""
-    headers = {"X-API-Key": api_key}
-    if content_type:
-        headers["Content-Type"] = content_type
-    req = urllib.request.Request(endpoint, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        raise ConnectionError("AzuraCast connection error: {}".format(e.reason))
- 
- 
-def azuracast_clear_playlist(base_url, api_key, station_id, playlist_id):
-    """
-    Clear all tracks from a playlist using the AzuraCast batch files API.
- 
-    Strategy:
-      1. Paginate through all station files that belong to this playlist.
-      2. Collect their internal file IDs.
-      3. POST a single batch request that sets their playlists to empty,
-         removing them from this playlist in one call.
- 
-    This is how the AzuraCast web UI clears a playlist internally.
-    """
-    log.info("Fetching current playlist contents...")
- 
-    file_ids = []
-    page = 1
-    per_page = 100
- 
-    while True:
-        endpoint = "{}/api/station/{}/files?playlist[]={}&per_page={}&page={}".format(
-            base_url, station_id, playlist_id, per_page, page
-        )
-        status, body = _az_request(endpoint, api_key)
- 
-        if status != 200:
-            log.warning(
-                "Could not fetch playlist files (HTTP {}). "
-                "Skipping clear -- playlist may have duplicates after import.".format(status)
-            )
-            return
- 
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            log.warning("Could not parse files response. Skipping clear.")
-            return
- 
-        # AzuraCast paginates as {"rows": [...], "total": N} or just a plain list
-        if isinstance(data, dict):
-            rows = data.get("rows", [])
-            total = data.get("total", 0)
-        else:
-            rows = data
-            total = len(rows)
- 
-        for f in rows:
-            fid = f.get("id")
-            if fid is not None:
-                file_ids.append(fid)
- 
-        if len(file_ids) >= total or len(rows) < per_page:
-            break
-        page += 1
- 
-    if not file_ids:
-        log.info("Playlist is already empty.")
-        return
- 
-    log.info("Clearing {} track(s) from playlist via batch API...".format(len(file_ids)))
- 
-    # Batch update: set playlists to [] for all files currently in this playlist.
-    # AzuraCast interprets an empty playlists list as "remove from all playlists".
-    batch_payload = json.dumps({
-        "do": "playlist",
-        "files": file_ids,
-        "playlists": []
-    }).encode("utf-8")
- 
-    batch_endpoint = "{}/api/station/{}/files/batch".format(base_url, station_id)
-    status, body = _az_request(
-        batch_endpoint, api_key,
-        method="POST", data=batch_payload,
-        content_type="application/json"
-    )
- 
-    if status in (200, 204):
-        log.info("Playlist cleared successfully.")
-    else:
-        log.warning(
-            "Batch clear returned HTTP {}. "
-            "Playlist may still contain old tracks. Response: {}".format(status, body[:200])
-        )
- 
- 
 def azuracast_upload(m3u_path, az_config):
     """
     Overwrite an AzuraCast playlist with the generated M3U.
-    Clears existing contents first via the batch files API, then imports.
+
+    Uses subprocess curl for both steps so the HTTP calls behave exactly
+    as they do from the command line -- no urllib multipart quirks.
+
+    Step 1: DELETE the playlist and recreate it (true overwrite, no append).
+    Step 2: Import the M3U into the fresh playlist via the confirmed-working
+            curl command the user already validated manually.
     """
+    import subprocess
+
     url         = az_config.get("url", "").rstrip("/")
     api_key     = az_config.get("api_key", "")
     station_id  = az_config.get("station_id", 0)
     playlist_id = az_config.get("playlist_id", 0)
- 
+
     if not all([url, api_key, station_id, playlist_id]):
         log.info("AzuraCast config incomplete -- skipping upload.")
         return
- 
-    # Step 1: clear existing playlist contents
-    azuracast_clear_playlist(url, api_key, station_id, playlist_id)
- 
-    # Step 2: import new M3U
-    endpoint = "{}/api/station/{}/playlist/{}/import".format(
-        url, station_id, playlist_id
+
+    def curl(*args):
+        """Run a curl command, return (returncode, stdout, stderr)."""
+        cmd = ["curl", "-s", "-w", "\n%{http_code}", "-H", "X-API-Key: {}".format(api_key)]
+        cmd += list(args)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Last line of stdout is the HTTP status code (from -w)
+        lines = result.stdout.strip().rsplit("\n", 1)
+        body   = lines[0] if len(lines) > 1 else ""
+        status = int(lines[-1]) if lines[-1].isdigit() else 0
+        return status, body, result.stderr
+
+    # ------------------------------------------------------------------
+    # Step 1: GET the current playlist settings so we can recreate it
+    # ------------------------------------------------------------------
+    log.info("Fetching playlist settings from AzuraCast...")
+    status, body, _ = curl(
+        "{}/api/station/{}/playlist/{}".format(url, station_id, playlist_id)
     )
-    log.info("Importing playlist to AzuraCast...")
- 
-    with open(m3u_path, "rb") as f:
-        m3u_bytes = f.read()
- 
-    boundary = "----PlaylistBoundary"
-    body = (
-        "--{}\r\nContent-Disposition: form-data; name=\"playlist_file\";"
-        " filename=\"playlist.m3u\"\r\nContent-Type: audio/x-mpegurl\r\n\r\n"
-    ).format(boundary).encode("utf-8") \
-        + m3u_bytes \
-        + "\r\n--{}--\r\n".format(boundary).encode("utf-8")
- 
-    try:
-        status, resp_body = _az_request(
-            endpoint, api_key, method="POST", data=body,
-            content_type="multipart/form-data; boundary={}".format(boundary)
+
+    if status != 200:
+        log.error(
+            "Could not fetch playlist (HTTP {}). "
+            "Check your url, station_id, playlist_id and api_key.".format(status)
         )
+        return
+
+    try:
+        playlist_data = json.loads(body)
+    except json.JSONDecodeError:
+        log.error("Could not parse playlist response: {}".format(body[:200]))
+        return
+
+    # Preserve the settings that matter
+    preserved = {
+        "name":        playlist_data.get("name", "Smart Playlist"),
+        "type":        playlist_data.get("type", "default"),
+        "source":      playlist_data.get("source", "songs"),
+        "order":       playlist_data.get("order", "sequential"),
+        "is_enabled":  playlist_data.get("is_enabled", True),
+        "weight":      playlist_data.get("weight", 3),
+        "include_in_requests": playlist_data.get("include_in_requests", True),
+    }
+
+    log.info("Playlist '{}' will be replaced.".format(preserved["name"]))
+
+    # ------------------------------------------------------------------
+    # Step 2: DELETE the existing playlist (clears all songs with it)
+    # ------------------------------------------------------------------
+    log.info("Deleting existing playlist...")
+    status, body, _ = curl(
+        "-X", "DELETE",
+        "{}/api/station/{}/playlist/{}".format(url, station_id, playlist_id)
+    )
+    if status not in (200, 204):
+        log.error("Failed to delete playlist (HTTP {}): {}".format(status, body[:200]))
+        return
+    log.info("Playlist deleted.")
+
+    # ------------------------------------------------------------------
+    # Step 3: Recreate the playlist with the same settings
+    # ------------------------------------------------------------------
+    log.info("Recreating playlist...")
+    status, body, _ = curl(
+        "-X", "POST",
+        "{}/api/station/{}/playlist".format(url, station_id),
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps(preserved)
+    )
+
+    if status not in (200, 201):
+        log.error("Failed to recreate playlist (HTTP {}): {}".format(status, body[:200]))
+        return
+
+    try:
+        new_playlist = json.loads(body)
+        new_id = new_playlist.get("id")
+    except json.JSONDecodeError:
+        log.error("Could not parse new playlist response: {}".format(body[:200]))
+        return
+
+    if not new_id:
+        log.error("New playlist ID missing from response: {}".format(body[:200]))
+        return
+
+    log.info("Playlist recreated with ID {}.".format(new_id))
+
+    # ------------------------------------------------------------------
+    # Step 4: Import the M3U into the new playlist
+    #         (exact curl command the user confirmed works)
+    # ------------------------------------------------------------------
+    log.info("Importing M3U into AzuraCast playlist {}...".format(new_id))
+    status, body, stderr = curl(
+        "-X", "POST",
+        "{}/api/station/{}/playlist/{}/import".format(url, station_id, new_id),
+        "-H", "Content-Type: multipart/form-data",
+        "-F", "playlist_file=@{}".format(m3u_path)
+    )
+
+    if status in (200, 201):
         try:
-            result  = json.loads(resp_body)
+            result  = json.loads(body)
             found   = result.get("files_found", "?")
             success = result.get("files_success", "?")
-            log.info("AzuraCast import complete: {}/{} tracks matched.".format(
-                success, found
-            ))
+            log.info("Import complete: {}/{} tracks matched.".format(success, found))
         except json.JSONDecodeError:
-            log.info("AzuraCast import response (HTTP {}): {}".format(
-                status, resp_body[:200]
-            ))
-    except ConnectionError as e:
-        log.error(str(e))
+            log.info("Import complete (HTTP {}): {}".format(status, body[:200]))
+    else:
+        log.error("Import failed (HTTP {}): {}".format(status, body[:200]))
+        if stderr:
+            log.error("curl stderr: {}".format(stderr[:200]))
+        return
 
+    # ------------------------------------------------------------------
+    # Step 5: Update the config file with the new playlist ID so the
+    #         next run targets the correct playlist automatically.
+    # ------------------------------------------------------------------
+    config_path = az_config.get("_config_path")
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            if "azuracast" not in raw:
+                raw["azuracast"] = {}
+            raw["azuracast"]["playlist_id"] = new_id
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(raw, f, allow_unicode=True, default_flow_style=False)
+            log.info("Config updated: playlist_id is now {}.".format(new_id))
+        except Exception as e:
+            log.warning(
+                "Could not update config with new playlist_id {}. "
+                "Update it manually. Error: {}".format(new_id, e)
+            )
+    else:
+        log.warning(
+            "New playlist ID is {}. "
+            "Update 'playlist_id' in your config manually.".format(new_id)
+        )
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1006,7 +1013,11 @@ def main():
         if not os.path.exists(m3u):
             log.error("M3U not found at '{}'. Run without --upload-only first.".format(m3u))
             sys.exit(1)
-        azuracast_upload(m3u, config["azuracast"])
+        # add _config_path so the function can update the id after recreating
+        config["azuracast"]["_config_path"] = args.config
+
+        # then the calls stay the same
+        azuracast_upload(config["output_m3u"], config["azuracast"])
         return
 
     conn   = init_db(config["db_path"])
@@ -1029,6 +1040,10 @@ def main():
         sys.exit(1)
 
     write_m3u(playlist, tracks, config["output_m3u"])
+     # add _config_path so the function can update the id after recreating
+    config["azuracast"]["_config_path"] = args.config
+
+    # then the calls stay the same
     azuracast_upload(config["output_m3u"], config["azuracast"])
 
 

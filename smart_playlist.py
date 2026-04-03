@@ -877,10 +877,10 @@ def azuracast_upload(m3u_path, az_config):
     # ------------------------------------------------------------------
     # Step 4: Import the M3U  (exact curl form the user confirmed works)
     # ------------------------------------------------------------------
-    log.info("Importing M3U into AzuraCast playlist {}...".format(new_id))
+    log.info("Importing M3U into AzuraCast playlist {}...".format(playlist_id))
     status, body, stderr = curl(
         "-X", "POST",
-        "{}/api/station/{}/playlist/{}/import".format(url, station_id, new_id),
+        "{}/api/station/{}/playlist/{}/import".format(url, station_id, playlist_id),
         "-H", "Content-Type: multipart/form-data",
         "-F", "playlist_file=@{}".format(m3u_path)
     )

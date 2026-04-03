@@ -912,12 +912,12 @@ def main():
     )
     parser.add_argument(
         "config", nargs="?", default="config.yaml",
-        help="Path to YAML config file (default: config.yaml)",
+        help="Path to a YAML config file or a directory containing .yaml config files.",
     )
     parser.add_argument("--sync-only",   action="store_true",
-                        help="Sync embeddings then exit.")
+                        help="Sync embeddings then exit without generating playlists.")
     parser.add_argument("--upload-only", action="store_true",
-                        help="Upload existing M3U to AzuraCast without regenerating.")
+                        help="Upload existing M3U(s) to AzuraCast without regenerating.")
     parser.add_argument("--list-modes",  action="store_true",
                         help="Print available interpolation modes and exit.")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -934,45 +934,71 @@ def main():
             print("  {:12s}  {}".format(name, first))
         sys.exit(0)
 
-    if not os.path.exists(args.config):
-        log.error("Config file not found: {}".format(args.config))
-        sys.exit(1)
-
-    try:
-        config = load_config(args.config)
-    except (ValueError, yaml.YAMLError) as exc:
-        log.error("Config error: {}".format(exc))
-        sys.exit(1)
-
-    if args.upload_only:
-        m3u = config["output_m3u"]
-        if not os.path.exists(m3u):
-            log.error("M3U not found at '{}'. Run without --upload-only first.".format(m3u))
+    # Resolve config path(s)
+    config_files = []
+    if os.path.isdir(args.config):
+        config_files = sorted(
+            os.path.join(args.config, f)
+            for f in os.listdir(args.config)
+            if f.endswith(".yaml") or f.endswith(".yml")
+        )
+        if not config_files:
+            log.error("No .yaml files found in directory: {}".format(args.config))
             sys.exit(1)
-        azuracast_upload(m3u, config["azuracast"])
-        return
-
-    conn   = init_db(config["db_path"])
-    tracks = sync_library(conn, config)
-
-    if not tracks:
-        log.error("No tracks with embeddings found. Check library_path and audio_formats.")
+        log.info("Found {} config(s) in {}".format(len(config_files), args.config))
+    elif os.path.isfile(args.config):
+        config_files = [args.config]
+    else:
+        log.error("Config path not found: {}".format(args.config))
         sys.exit(1)
 
-    log.info("Library ready: {} tracks with embeddings.".format(len(tracks)))
+    for config_path in config_files:
+        log.info("--- Processing: {} ---".format(config_path))
+
+        try:
+            config = load_config(config_path)
+        except (ValueError, yaml.YAMLError) as exc:
+            log.error("Config error in {}: {}".format(config_path, exc))
+            continue
+
+        if args.upload_only:
+            m3u = config["output_m3u"]
+            if not os.path.exists(m3u):
+                log.error(
+                    "M3U not found at '{}'. "
+                    "Run without --upload-only first.".format(m3u)
+                )
+                continue
+            azuracast_upload(m3u, config["azuracast"])
+            continue
+
+        conn   = init_db(config["db_path"])
+        tracks = sync_library(conn, config)
+
+        if not tracks:
+            log.error(
+                "No tracks with embeddings found. "
+                "Check library_path and audio_formats in {}.".format(config_path)
+            )
+            continue
+
+        log.info("Library ready: {} tracks with embeddings.".format(len(tracks)))
+
+        if args.sync_only:
+            log.info("--sync-only: skipping playlist generation for {}.".format(config_path))
+            continue
+
+        try:
+            playlist = build_playlist(config, tracks)
+        except ValueError as exc:
+            log.error(str(exc))
+            continue
+
+        write_m3u(playlist, tracks, config["output_m3u"])
+        azuracast_upload(config["output_m3u"], config["azuracast"])
 
     if args.sync_only:
         log.info("--sync-only: done.")
-        return
-
-    try:
-        playlist = build_playlist(config, tracks)
-    except ValueError as exc:
-        log.error(str(exc))
-        sys.exit(1)
-
-    write_m3u(playlist, tracks, config["output_m3u"])
-    azuracast_upload(config["output_m3u"], config["azuracast"])
 
 
 if __name__ == "__main__":

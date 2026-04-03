@@ -866,40 +866,14 @@ def azuracast_upload(m3u_path, az_config):
     log.info("Deleting existing playlist...")
     status, body, _ = curl(
         "-X", "DELETE",
-        "{}/api/station/{}/playlist/{}".format(url, station_id, playlist_id)
+        "{}/api/station/{}/playlist/{}/empty".format(url, station_id, playlist_id)
     )
     if status not in (200, 204):
         log.error("Failed to delete playlist (HTTP {}): {}".format(status, body[:200]))
         return
-    log.info("Playlist deleted.")
+    log.info("Playlist emptied.")
 
-    # ------------------------------------------------------------------
-    # Step 3: Recreate the playlist with the same settings
-    # ------------------------------------------------------------------
-    log.info("Recreating playlist...")
-    status, body, _ = curl(
-        "-X", "POST",
-        "{}/api/station/{}/playlist".format(url, station_id),
-        "-H", "Content-Type: application/json",
-        "-d", json.dumps(preserved)
-    )
-    if status not in (200, 201):
-        log.error("Failed to recreate playlist (HTTP {}): {}".format(status, body[:200]))
-        return
-
-    try:
-        new_playlist = json.loads(body)
-        new_id       = new_playlist.get("id")
-    except json.JSONDecodeError:
-        log.error("Could not parse new playlist response: {}".format(body[:200]))
-        return
-
-    if not new_id:
-        log.error("New playlist ID missing from response: {}".format(body[:200]))
-        return
-
-    log.info("Playlist recreated with ID {}.".format(new_id))
-
+    
     # ------------------------------------------------------------------
     # Step 4: Import the M3U  (exact curl form the user confirmed works)
     # ------------------------------------------------------------------
@@ -924,30 +898,6 @@ def azuracast_upload(m3u_path, az_config):
         if stderr:
             log.error("curl stderr: {}".format(stderr[:200]))
         return
-
-    # ------------------------------------------------------------------
-    # Step 5: Write new playlist_id back to config.yaml
-    # ------------------------------------------------------------------
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-            if "azuracast" not in raw:
-                raw["azuracast"] = {}
-            raw["azuracast"]["playlist_id"] = new_id
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(raw, f, allow_unicode=True, default_flow_style=False)
-            log.info("Config updated: playlist_id is now {}.".format(new_id))
-        except Exception as e:
-            log.warning(
-                "Could not update config with new playlist_id {}. "
-                "Update it manually. Error: {}".format(new_id, e)
-            )
-    else:
-        log.warning(
-            "New playlist ID is {}. "
-            "Update 'playlist_id' in your config manually.".format(new_id)
-        )
 
 
 # ---------------------------------------------------------------------------

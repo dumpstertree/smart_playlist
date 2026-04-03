@@ -834,7 +834,7 @@ def azuracast_upload(m3u_path, az_config):
     # ------------------------------------------------------------------
     log.info("Fetching playlist settings from AzuraCast...")
     status, body, _ = curl(
-        "{}/api/station/{}/playlist/{}".format(url, station_id, playlist_id)
+        "{}/api/station/{}/playlists/{}".format(url, station_id, playlist_id)
     )
     if status != 200:
         log.error(

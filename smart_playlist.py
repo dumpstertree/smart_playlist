@@ -832,6 +832,7 @@ def azuracast_upload(m3u_path, az_config):
     # ------------------------------------------------------------------
     # Step 1: Fetch current playlist settings
     # ------------------------------------------------------------------
+    '''
     log.info("Fetching playlist settings from AzuraCast...")
     status, body, _ = curl(
         "{}/api/station/{}/playlist/{}".format(url, station_id, playlist_id)
@@ -848,7 +849,6 @@ def azuracast_upload(m3u_path, az_config):
     except json.JSONDecodeError:
         log.error("Could not parse playlist response: {}".format(body[:200]))
         return
-
     preserved = {
         "name":               playlist_data.get("name", "Smart Playlist"),
         "type":               playlist_data.get("type", "default"),
@@ -859,7 +859,7 @@ def azuracast_upload(m3u_path, az_config):
         "include_in_requests": playlist_data.get("include_in_requests", True),
     }
     log.info("Playlist '{}' will be replaced.".format(preserved["name"]))
-
+'''
     # ------------------------------------------------------------------
     # Step 2: Delete the existing playlist
     # ------------------------------------------------------------------

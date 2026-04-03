@@ -23,10 +23,9 @@ import hashlib
 import logging
 import argparse
 import random
-import numpy as np
-import urllib.request
-import urllib.error
+import subprocess
 import json
+import numpy as np
 from abc import ABC, abstractmethod
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -83,12 +82,12 @@ DEFAULTS = {
     "allow_anchors_in_pool": False,
     "fuzzy_match_threshold": 0.6,
     "loop": False,
-    # Anchor sources -- all optional, combined into one pool then randomly sampled
+    # Anchor sources -- all combined into one pool then randomly sampled
     "anchor_songs": [],
     "anchor_albums": [],
     "anchor_artists": [],
     "anchor_genres": [],
-    # Exclusion sources -- all optional, union of all matches is removed from pool
+    # Exclusion sources -- union of all matches removed from interpolation pool
     "exclude_songs": [],
     "exclude_albums": [],
     "exclude_artists": [],
@@ -118,6 +117,8 @@ def load_config(path):
     az_defaults = dict(DEFAULTS["azuracast"])
     az_user = user.get("azuracast", {}) or {}
     config["azuracast"] = {**az_defaults, **az_user}
+    # Store config path so upload can update playlist_id after recreating
+    config["azuracast"]["_config_path"] = path
 
     has_anchors = any(
         config.get(k) for k in
@@ -137,7 +138,7 @@ def load_config(path):
 
 
 # ---------------------------------------------------------------------------
-# Database  (schema v2 adds album + genre columns)
+# Database  (schema includes album + genre columns)
 # ---------------------------------------------------------------------------
 
 SCHEMA = """
@@ -151,11 +152,6 @@ CREATE TABLE IF NOT EXISTS tracks (
     file_hash   TEXT    NOT NULL,
     embedding   BLOB
 );
-"""
-
-MIGRATION = """
-ALTER TABLE tracks ADD COLUMN album TEXT NOT NULL DEFAULT '';
-ALTER TABLE tracks ADD COLUMN genre TEXT NOT NULL DEFAULT '';
 """
 
 
@@ -262,14 +258,12 @@ def _fuzzy(a, b):
 
 
 def _best_fuzzy_score(query, candidates):
-    """Return the highest fuzzy score between query and any string in candidates."""
     if not candidates:
         return 0.0
     return max(_fuzzy(query, c) for c in candidates if c)
 
 
 def matches_song(query, info, threshold):
-    """Match 'Artist - Title' against a track's tags."""
     candidate = "{} - {}".format(info["artist"], info["title"])
     return _fuzzy(query, candidate) >= threshold
 
@@ -279,7 +273,6 @@ def matches_artist(query, info, threshold):
 
 
 def matches_album(query, info, threshold):
-    """Match 'Artist - Album' or plain album name."""
     if not info["album"]:
         return False
     full = "{} - {}".format(info["artist"], info["album"])
@@ -287,7 +280,6 @@ def matches_album(query, info, threshold):
 
 
 def matches_genre(query, info, threshold):
-    """Match against the genre tag; supports comma/slash separated multi-genre fields."""
     raw = info.get("genre", "")
     if not raw:
         return False
@@ -302,13 +294,11 @@ def matches_genre(query, info, threshold):
 def build_anchor_pool(config, tracks):
     """
     Compile the full set of candidate anchor tracks from all anchor_* lists.
-    Returns a list of paths (may contain duplicates if a track matches multiple
-    criteria -- deduplicated before returning).
+    Returns a deduplicated list of paths.
     """
     threshold = config.get("fuzzy_match_threshold", 0.6)
     pool = set()
 
-    # anchor_songs
     for query in (config.get("anchor_songs") or []):
         matched = [p for p, info in tracks.items() if matches_song(query, info, threshold)]
         if matched:
@@ -317,7 +307,6 @@ def build_anchor_pool(config, tracks):
         else:
             log.warning("  anchor_song '{}' -> no match".format(query))
 
-    # anchor_artists
     for query in (config.get("anchor_artists") or []):
         matched = [p for p, info in tracks.items() if matches_artist(query, info, threshold)]
         if matched:
@@ -326,7 +315,6 @@ def build_anchor_pool(config, tracks):
         else:
             log.warning("  anchor_artist '{}' -> no match".format(query))
 
-    # anchor_albums
     for query in (config.get("anchor_albums") or []):
         matched = [p for p, info in tracks.items() if matches_album(query, info, threshold)]
         if matched:
@@ -335,7 +323,6 @@ def build_anchor_pool(config, tracks):
         else:
             log.warning("  anchor_album '{}' -> no match".format(query))
 
-    # anchor_genres
     for query in (config.get("anchor_genres") or []):
         matched = [p for p, info in tracks.items() if matches_genre(query, info, threshold)]
         if matched:
@@ -349,9 +336,9 @@ def build_anchor_pool(config, tracks):
 
 def resolve_anchors(config, tracks):
     """
-    Build the full anchor candidate pool from all anchor_* sources,
-    then randomly sample num_anchors from it.
-    Raises ValueError if the pool is too small to satisfy num_anchors.
+    Build the full anchor candidate pool then randomly sample num_anchors from it.
+    Raises ValueError if the pool is too small.
+    There is NO upper limit on num_anchors.
     """
     num_wanted = config["num_anchors"]
 
@@ -386,7 +373,6 @@ def resolve_anchors(config, tracks):
 def build_exclude_set(config, tracks):
     """
     Compile the full set of paths to exclude from the interpolation pool.
-    Returns a set of paths.
     """
     threshold = config.get("fuzzy_match_threshold", 0.6)
     excluded = set()
@@ -570,9 +556,9 @@ class PathStrategy(InterpolationStrategy):
 
     def fill(self, anchor_a, anchor_b, count, tracks, pool, used, config,
              recent_artists=None):
-        emb_a    = self._emb(anchor_a, tracks)
-        emb_b    = self._emb(anchor_b, tracks)
-        result   = []
+        emb_a      = self._emb(anchor_a, tracks)
+        emb_b      = self._emb(anchor_b, tracks)
+        result     = []
         local_used = set()
 
         for i in range(1, count + 1):
@@ -600,9 +586,9 @@ class MidpointStrategy(InterpolationStrategy):
         if count == 0:
             return []
 
-        emb_a    = self._emb(anchor_a, tracks)
-        emb_b    = self._emb(anchor_b, tracks)
-        mid_emb  = (emb_a + emb_b) / 2.0
+        emb_a      = self._emb(anchor_a, tracks)
+        emb_b      = self._emb(anchor_b, tracks)
+        mid_emb    = (emb_a + emb_b) / 2.0
         local_used = set()
 
         mid_picks = nearest_to(mid_emb, pool, used | local_used)
@@ -717,9 +703,6 @@ def build_playlist(config, tracks):
     log.info("Building exclusion set...")
     exclude_set = build_exclude_set(config, tracks)
 
-    # Remove excluded tracks from the pool available for interpolation.
-    # Anchors may still come from excluded tracks if they were matched via
-    # anchor_songs/artists/albums/genres -- exclusions only affect the fill pool.
     fill_pool = {p: t for p, t in tracks.items() if p not in exclude_set}
 
     log.info("Resolving anchors  (mode={}, interpolation_count={}, loop={})".format(
@@ -809,47 +792,54 @@ def azuracast_upload(m3u_path, az_config):
     """
     Overwrite an AzuraCast playlist with the generated M3U.
 
-    Uses subprocess curl for both steps so the HTTP calls behave exactly
-    as they do from the command line -- no urllib multipart quirks.
+    Uses subprocess curl for all HTTP calls -- this matches the exact curl
+    command confirmed to work and avoids urllib multipart encoding issues.
 
-    Step 1: DELETE the playlist and recreate it (true overwrite, no append).
-    Step 2: Import the M3U into the fresh playlist via the confirmed-working
-            curl command the user already validated manually.
+    Flow:
+      1. GET current playlist settings so we can recreate it identically.
+      2. DELETE the playlist (removes all song associations cleanly).
+      3. POST to recreate the playlist with the same settings.
+      4. POST the M3U to the import endpoint of the new playlist.
+      5. Write the new playlist_id back to config.yaml automatically.
     """
-    import subprocess
-
     url         = az_config.get("url", "").rstrip("/")
     api_key     = az_config.get("api_key", "")
     station_id  = az_config.get("station_id", 0)
     playlist_id = az_config.get("playlist_id", 0)
+    config_path = az_config.get("_config_path", "")
 
     if not all([url, api_key, station_id, playlist_id]):
         log.info("AzuraCast config incomplete -- skipping upload.")
         return
 
     def curl(*args):
-        """Run a curl command, return (returncode, stdout, stderr)."""
-        cmd = ["curl", "-s", "-w", "\n%{http_code}", "-H", "X-API-Key: {}".format(api_key)]
-        cmd += list(args)
+        """
+        Run curl with the API key header pre-set.
+        Returns (http_status_int, body_str, stderr_str).
+        Uses -w to append the HTTP status code as the last line of stdout.
+        """
+        cmd = [
+            "curl", "-s",
+            "-w", "\n%{http_code}",
+            "-H", "X-API-Key: {}".format(api_key),
+        ] + list(args)
         result = subprocess.run(cmd, capture_output=True, text=True)
-        # Last line of stdout is the HTTP status code (from -w)
-        lines = result.stdout.strip().rsplit("\n", 1)
+        lines  = result.stdout.strip().rsplit("\n", 1)
         body   = lines[0] if len(lines) > 1 else ""
-        status = int(lines[-1]) if lines[-1].isdigit() else 0
+        status = int(lines[-1]) if lines and lines[-1].isdigit() else 0
         return status, body, result.stderr
 
     # ------------------------------------------------------------------
-    # Step 1: GET the current playlist settings so we can recreate it
+    # Step 1: Fetch current playlist settings
     # ------------------------------------------------------------------
     log.info("Fetching playlist settings from AzuraCast...")
     status, body, _ = curl(
         "{}/api/station/{}/playlist/{}".format(url, station_id, playlist_id)
     )
-
     if status != 200:
         log.error(
             "Could not fetch playlist (HTTP {}). "
-            "Check your url, station_id, playlist_id and api_key.".format(status)
+            "Check url / station_id / playlist_id / api_key.".format(status)
         )
         return
 
@@ -859,21 +849,19 @@ def azuracast_upload(m3u_path, az_config):
         log.error("Could not parse playlist response: {}".format(body[:200]))
         return
 
-    # Preserve the settings that matter
     preserved = {
-        "name":        playlist_data.get("name", "Smart Playlist"),
-        "type":        playlist_data.get("type", "default"),
-        "source":      playlist_data.get("source", "songs"),
-        "order":       playlist_data.get("order", "sequential"),
-        "is_enabled":  playlist_data.get("is_enabled", True),
-        "weight":      playlist_data.get("weight", 3),
+        "name":               playlist_data.get("name", "Smart Playlist"),
+        "type":               playlist_data.get("type", "default"),
+        "source":             playlist_data.get("source", "songs"),
+        "order":              playlist_data.get("order", "sequential"),
+        "is_enabled":         playlist_data.get("is_enabled", True),
+        "weight":             playlist_data.get("weight", 3),
         "include_in_requests": playlist_data.get("include_in_requests", True),
     }
-
     log.info("Playlist '{}' will be replaced.".format(preserved["name"]))
 
     # ------------------------------------------------------------------
-    # Step 2: DELETE the existing playlist (clears all songs with it)
+    # Step 2: Delete the existing playlist
     # ------------------------------------------------------------------
     log.info("Deleting existing playlist...")
     status, body, _ = curl(
@@ -895,14 +883,13 @@ def azuracast_upload(m3u_path, az_config):
         "-H", "Content-Type: application/json",
         "-d", json.dumps(preserved)
     )
-
     if status not in (200, 201):
         log.error("Failed to recreate playlist (HTTP {}): {}".format(status, body[:200]))
         return
 
     try:
         new_playlist = json.loads(body)
-        new_id = new_playlist.get("id")
+        new_id       = new_playlist.get("id")
     except json.JSONDecodeError:
         log.error("Could not parse new playlist response: {}".format(body[:200]))
         return
@@ -914,8 +901,7 @@ def azuracast_upload(m3u_path, az_config):
     log.info("Playlist recreated with ID {}.".format(new_id))
 
     # ------------------------------------------------------------------
-    # Step 4: Import the M3U into the new playlist
-    #         (exact curl command the user confirmed works)
+    # Step 4: Import the M3U  (exact curl form the user confirmed works)
     # ------------------------------------------------------------------
     log.info("Importing M3U into AzuraCast playlist {}...".format(new_id))
     status, body, stderr = curl(
@@ -940,10 +926,8 @@ def azuracast_upload(m3u_path, az_config):
         return
 
     # ------------------------------------------------------------------
-    # Step 5: Update the config file with the new playlist ID so the
-    #         next run targets the correct playlist automatically.
+    # Step 5: Write new playlist_id back to config.yaml
     # ------------------------------------------------------------------
-    config_path = az_config.get("_config_path")
     if config_path and os.path.exists(config_path):
         try:
             with open(config_path, encoding="utf-8") as f:
@@ -964,6 +948,8 @@ def azuracast_upload(m3u_path, az_config):
             "New playlist ID is {}. "
             "Update 'playlist_id' in your config manually.".format(new_id)
         )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1013,11 +999,7 @@ def main():
         if not os.path.exists(m3u):
             log.error("M3U not found at '{}'. Run without --upload-only first.".format(m3u))
             sys.exit(1)
-        # add _config_path so the function can update the id after recreating
-        config["azuracast"]["_config_path"] = args.config
-
-        # then the calls stay the same
-        azuracast_upload(config["output_m3u"], config["azuracast"])
+        azuracast_upload(m3u, config["azuracast"])
         return
 
     conn   = init_db(config["db_path"])
@@ -1040,10 +1022,6 @@ def main():
         sys.exit(1)
 
     write_m3u(playlist, tracks, config["output_m3u"])
-     # add _config_path so the function can update the id after recreating
-    config["azuracast"]["_config_path"] = args.config
-
-    # then the calls stay the same
     azuracast_upload(config["output_m3u"], config["azuracast"])
 
 

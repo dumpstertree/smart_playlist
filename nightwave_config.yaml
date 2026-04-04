@@ -29,7 +29,17 @@ azuracast:
   playlist_id: 0
 
 # Anchors
-anchor_songs: []
+anchor_songs: 
+  -"Diablo II Resurrected - Tristram"
+  -"Etrian Odyssey I HD - Dungeon 2"
+  -"Etrian Odyssey I HD - Dungeon 3"
+  -"Etrian Odyssey I HD - Dungeon 4"
+  -"Etrian Odyssey I HD - Dungeon 5"
+  -"Hollow Knight - Dirtmouth"
+  -"Hollow Knight - Crystal Peak"
+  -"Hollow Knight - City of Tears"
+  -"Metroid Prime - Crashed Frigate Orpheon"
+  -"Wild Arms Alter Code-F - The Elw Dimension"
 anchor_artists: []
 anchor_albums: []
 anchor_genres: []

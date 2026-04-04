@@ -29,7 +29,16 @@ azuracast:
   playlist_id: 0
 
 # Anchors
-anchor_songs: []
+anchor_songs: 
+  -"Dark Souls III - Firelink Shrine"
+  -"Bloodborne - Hunter's Dream"
+  -"Dark Souls II - Majula"
+  -"Dark Souls - Firelink Shrine"
+  -"Diablo III Collector's Edition - Black Soulstone"
+  -"Gothic - Free Mine"
+  -"Gothic - New Camp"
+  -"Dark Souls III - Epilogue"
+  -"World of Warcraft - Duskwood"
 anchor_artists: []
 anchor_albums: []
 anchor_genres: []

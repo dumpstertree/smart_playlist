@@ -29,7 +29,13 @@ azuracast:
   playlist_id: 0
 
 # Anchors
-anchor_songs: []
+anchor_songs: 
+  - "Animal Crossing - 005 - Title"
+  - "Pokemon Sun & Moon - 06. My Home"
+  - "Super Mario Sunshine - 39. Sky & Sea"
+  - "Wii Music Collection -06. Shop Channel Title"
+  - "Ooblets - 14. Twinkle Town"
+
 anchor_artists: []
 anchor_albums: []
 anchor_genres: []

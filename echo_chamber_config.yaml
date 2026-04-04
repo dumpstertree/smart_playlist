@@ -2,7 +2,7 @@
 library_path: /raid/passive
 db_path: /app/embeddings.db
 model_path: /models/discogs-effnet-bs64-1.pb
-output_m3u: /app/daydreaming.m3u
+output_m3u: /app/echochamber.m3u
 audio_formats:
   - mp3
   - flac

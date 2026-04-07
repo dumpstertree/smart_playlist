@@ -904,6 +904,74 @@ def azuracast_upload(m3u_path, az_config):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def run_once(args, config_files):
+    """
+    Process all config files once -- sync, build, write, upload.
+    Returns True if at least one config completed without a fatal error.
+    """
+    any_success = False
+ 
+    for config_path in config_files:
+        log.info("--- Processing: {} ---".format(config_path))
+ 
+        try:
+            config = load_config(config_path)
+        except (ValueError, yaml.YAMLError) as exc:
+            log.error("Config error in {}: {}".format(config_path, exc))
+            continue
+ 
+        if args.upload_only:
+            m3u = config["output_m3u"]
+            if not os.path.exists(m3u):
+                log.error(
+                    "M3U not found at '{}'. "
+                    "Run without --upload-only first.".format(m3u)
+                )
+                continue
+            azuracast_upload(m3u, config["azuracast"])
+            any_success = True
+            continue
+ 
+        conn   = init_db(config["db_path"])
+        tracks = sync_library(conn, config)
+ 
+        if not tracks:
+            log.error(
+                "No tracks with embeddings found. "
+                "Check library_path and audio_formats in {}.".format(config_path)
+            )
+            continue
+ 
+        log.info("Library ready: {} tracks with embeddings.".format(len(tracks)))
+ 
+        if args.sync_only:
+            log.info("--sync-only: skipping playlist generation for {}.".format(config_path))
+            any_success = True
+            continue
+ 
+        try:
+            playlist = build_playlist(config, tracks)
+        except ValueError as exc:
+            log.error(str(exc))
+            continue
+ 
+        write_m3u(playlist, tracks, config["output_m3u"])
+        azuracast_upload(config["output_m3u"], config["azuracast"])
+        any_success = True
+ 
+    return any_success
+ 
+ 
+def next_run_at(hour, minute):
+    """Return a datetime for the next occurrence of HH:MM (today or tomorrow)."""
+    import datetime
+    now  = datetime.datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += datetime.timedelta(days=1)
+    return target
+ 
+ 
 def main():
     parser = argparse.ArgumentParser(
         description="Smart playlist generator -- Essentia Discogs-EffNet",
@@ -920,20 +988,24 @@ def main():
                         help="Upload existing M3U(s) to AzuraCast without regenerating.")
     parser.add_argument("--list-modes",  action="store_true",
                         help="Print available interpolation modes and exit.")
+    parser.add_argument("--daemon",      action="store_true",
+                        help="Run once then sleep until the next scheduled time, repeating forever.")
+    parser.add_argument("--run-at",      default="02:00", metavar="HH:MM",
+                        help="Time to run each day in daemon mode (default: 02:00).")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging.")
     args = parser.parse_args()
-
+ 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-
+ 
     if args.list_modes:
         print("Available interpolation modes:")
         for name, strat in STRATEGIES.items():
             first = strat.__class__.__doc__.strip().splitlines()[0]
             print("  {:12s}  {}".format(name, first))
         sys.exit(0)
-
+ 
     # Resolve config path(s)
     config_files = []
     if os.path.isdir(args.config):
@@ -951,55 +1023,43 @@ def main():
     else:
         log.error("Config path not found: {}".format(args.config))
         sys.exit(1)
-
-    for config_path in config_files:
-        log.info("--- Processing: {} ---".format(config_path))
-
-        try:
-            config = load_config(config_path)
-        except (ValueError, yaml.YAMLError) as exc:
-            log.error("Config error in {}: {}".format(config_path, exc))
-            continue
-
-        if args.upload_only:
-            m3u = config["output_m3u"]
-            if not os.path.exists(m3u):
-                log.error(
-                    "M3U not found at '{}'. "
-                    "Run without --upload-only first.".format(m3u)
-                )
-                continue
-            azuracast_upload(m3u, config["azuracast"])
-            continue
-
-        conn   = init_db(config["db_path"])
-        tracks = sync_library(conn, config)
-
-        if not tracks:
-            log.error(
-                "No tracks with embeddings found. "
-                "Check library_path and audio_formats in {}.".format(config_path)
-            )
-            continue
-
-        log.info("Library ready: {} tracks with embeddings.".format(len(tracks)))
-
+ 
+    # Parse --run-at
+    try:
+        run_hour, run_minute = [int(x) for x in args.run_at.split(":")]
+        assert 0 <= run_hour <= 23 and 0 <= run_minute <= 59
+    except Exception:
+        log.error("Invalid --run-at value '{}'. Use HH:MM format.".format(args.run_at))
+        sys.exit(1)
+ 
+    if args.daemon:
+        import time
+        import datetime
+        log.info("Daemon mode enabled. Will run daily at {:02d}:{:02d}.".format(
+            run_hour, run_minute
+        ))
+        # Run immediately on first start so you don't wait until 2am to verify it works
+        log.info("Running immediately on startup...")
+        run_once(args, config_files)
+ 
+        while True:
+            target   = next_run_at(run_hour, run_minute)
+            sleep_s  = (target - datetime.datetime.now()).total_seconds()
+            log.info("Next run at {} (sleeping {:.0f}s / {:.1f}h).".format(
+                target.strftime("%Y-%m-%d %H:%M"),
+                sleep_s,
+                sleep_s / 3600,
+            ))
+            time.sleep(sleep_s)
+            log.info("Waking up -- starting scheduled run.")
+            run_once(args, config_files)
+ 
+    else:
+        # Single run
+        run_once(args, config_files)
         if args.sync_only:
-            log.info("--sync-only: skipping playlist generation for {}.".format(config_path))
-            continue
-
-        try:
-            playlist = build_playlist(config, tracks)
-        except ValueError as exc:
-            log.error(str(exc))
-            continue
-
-        write_m3u(playlist, tracks, config["output_m3u"])
-        azuracast_upload(config["output_m3u"], config["azuracast"])
-
-    if args.sync_only:
-        log.info("--sync-only: done.")
-
-
+            log.info("--sync-only: done.")
+ 
+ 
 if __name__ == "__main__":
     main()
